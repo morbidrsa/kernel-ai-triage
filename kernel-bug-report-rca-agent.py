@@ -74,6 +74,7 @@ class Config:
     base_url: str = ""
     model: str = "qwen3:32b"
     repo: str = "."                  # path to local kernel git tree
+    branch: str = ""                 # git ref to analyze (default: checked-out HEAD)
     skills_dir: str = ""             # directory of SKILL.md folders or .md files
     max_turns: int = 10              # tool-call loop limit for the context agent
     max_tool_output: int = 8000      # chars of tool output fed back to the LLM
@@ -403,9 +404,11 @@ def _git(cfg: Config, *args: str, max_out: int = 8000) -> str:
 
 
 def build_tools(cfg: Config) -> list[Tool]:
+    rev = cfg.branch.strip() or "HEAD"
+
     def git_log(a):
         args = ["log", f"--max-count={int(a.get('n', 20))}",
-                "--oneline", "--no-merges"]
+                "--oneline", "--no-merges", rev]
         paths = a.get("paths") or []
         if paths:
             args.append("--")
@@ -413,32 +416,63 @@ def build_tools(cfg: Config) -> list[Tool]:
         return _git(cfg, *args)
 
     def git_show(a):
-        return _git(cfg, "show", "--stat", "--patch", a["commit"],
+        commit = a["commit"]
+        # Allow short SHAs / subjects to resolve against the chosen ref.
+        return _git(cfg, "show", "--stat", "--patch", commit,
                     max_out=cfg.max_tool_output)
 
     def git_blame(a):
         start = int(a.get("line", 1))
         span = int(a.get("span", 30))
         return _git(cfg, "blame", "-L", f"{start},{start + span}",
-                    "--date=short", a["file"], max_out=cfg.max_tool_output)
+                    "--date=short", rev, "--", a["file"],
+                    max_out=cfg.max_tool_output)
 
     def grep_source(a):
         pat = a["pattern"]
         paths = a.get("paths") or []
-        include = "--include=" + (a.get("include") or "*.[ch]")
-        cmd = ["grep", "-rn", "-E", pat, include] + (paths or ["."])
-        try:
-            out = subprocess.run(cmd, cwd=cfg.repo, capture_output=True,
-                                 text=True, timeout=60).stdout
-        except Exception as e:
-            return f"grep error: {e}"
+        if cfg.branch:
+            # Search the branch content, not the working tree.
+            args = ["grep", "-n", "-E", pat, cfg.branch, "--"] + \
+                   (paths or [":/"])
+            out = _git(cfg, *args, max_out=cfg.max_tool_output)
+        else:
+            include = "--include=" + (a.get("include") or "*.[ch]")
+            cmd = ["grep", "-rn", "-E", pat, include] + (paths or ["."])
+            try:
+                out = subprocess.run(cmd, cwd=cfg.repo, capture_output=True,
+                                     text=True, timeout=60).stdout
+            except Exception as e:
+                return f"grep error: {e}"
+        out = out or ""
+        if out == "(no output)":
+            out = ""
+        inc = (a.get("include") or "").strip()
+        if inc:
+            # git grep lines are file:line:content; filter on the filename.
+            out = "\n".join(l for l in out.splitlines()
+                            if l.split(":", 1)[0].endswith(
+                                inc.replace("*", "")))
         return out[:cfg.max_tool_output] or "(no matches)"
 
     def git_log_search(a):
-        return _git(cfg, "log", "--all", f"--grep={a['pattern']}", "-i",
+        scope = ["--all"] if not cfg.branch else [cfg.branch]
+        return _git(cfg, "log", *scope, f"--grep={a['pattern']}", "-i",
                     f"--max-count={int(a.get('n', 15))}", "--oneline")
 
     def read_file(a):
+        start = max(0, int(a.get("start", 1)) - 1)
+        end = start + int(a.get("count", 80))
+        if cfg.branch:
+            # Read file content from the branch, not the working tree.
+            out = _git(cfg, "show", f"{cfg.branch}:{a['path']}",
+                       max_out=cfg.max_tool_output * 4)
+            if out.startswith("fatal:"):
+                return out[:2000]
+            lines = out.splitlines()
+            return "".join(f"{start + i + 1:5d}: {l}\n"
+                           for i, l in enumerate(
+                               lines[start:end]))[:cfg.max_tool_output]
         p = os.path.normpath(os.path.join(cfg.repo, a["path"]))
         repo_abs = os.path.abspath(cfg.repo)
         if not os.path.abspath(p).startswith(repo_abs):
@@ -448,8 +482,6 @@ def build_tools(cfg: Config) -> list[Tool]:
                 lines = f.readlines()
         except OSError as e:
             return f"error: {e}"
-        start = max(0, int(a.get("start", 1)) - 1)
-        end = start + int(a.get("count", 80))
         return "".join(f"{start + i + 1:5d}: {l}"
                        for i, l in enumerate(lines[start:end]))[:cfg.max_tool_output]
 
@@ -471,7 +503,7 @@ def build_tools(cfg: Config) -> list[Tool]:
         return "\n".join(out) or "(no results)"
 
     def kernel_version(_a):
-        return _git(cfg, "describe", "--tags", "HEAD")
+        return _git(cfg, "describe", "--tags", cfg.branch.strip() or "HEAD")
 
     return [
         Tool({
@@ -685,6 +717,7 @@ Finish with a JSON object:
 {{"evidence": [{{"fact": "...", "source": "tool + query"}}],
   "suspect_commits": [{{"commit": "...", "subject": "...", "why_suspect": "..."}}]}}"""
     user = f"""Bug: {rep.subject}
+Analyzing branch/ref: {cfg.branch or 'HEAD (checked-out working tree)'}
 Crash signature: {triage.get('crash_signature')}
 Stack frames: {frames}
 Suspect components: {triage.get('components')}
@@ -868,6 +901,11 @@ def main() -> int:
         description="Agentic RCA for Linux kernel bug reports (mbox or txt).")
     ap.add_argument("report", help="bug report file (.mbox or .txt)")
     ap.add_argument("--repo", default=".", help="local kernel git tree path")
+    ap.add_argument("--branch", default=os.environ.get("KERNEL_RCA_BRANCH", ""),
+                    help="git ref/branch to analyze, e.g. 'for-next' or "
+                         "'v6.12' (default: checked-out HEAD; grep and file "
+                         "reads use the branch content, not the working "
+                         "tree, without touching your checkout)")
     ap.add_argument("--skills", default=os.environ.get("KERNEL_RCA_SKILLS", ""),
                     help="directory with skills (SKILL.md folders or .md files)")
     ap.add_argument("--backend", choices=["ollama", "vllm"], default="ollama")
@@ -885,7 +923,8 @@ def main() -> int:
 
     cfg = Config(backend=args.backend, base_url=args.base_url,
                  model=args.model, repo=args.repo, max_turns=args.max_turns,
-                 skills_dir=args.skills, json_mode=not args.no_json_mode)
+                 skills_dir=args.skills, branch=args.branch,
+                 json_mode=not args.no_json_mode)
     cfg.resolve()
 
     def log(msg):
@@ -898,9 +937,18 @@ def main() -> int:
 
     if not os.path.isdir(os.path.join(cfg.repo, ".git")):
         log(f"warning: {cfg.repo} does not look like a git tree")
+    if cfg.branch:
+        probe = subprocess.run(["git", "-C", cfg.repo, "rev-parse",
+                                "--verify", cfg.branch],
+                               capture_output=True, text=True)
+        if probe.returncode != 0:
+            log(f"error: branch/ref '{cfg.branch}' not found in {cfg.repo}: "
+                f"{probe.stderr.strip()}")
+            return 2
 
     log(f"kernel-bug-rca | model={cfg.model} backend={cfg.backend} "
         f"({cfg.base_url}) repo={cfg.repo}"
+        + (f" branch={cfg.branch}" if cfg.branch else "")
         + (f" skills={cfg.skills_dir} ({len(skills)})" if skills else ""))
     rep = ingest(args.report)
     log(f"Ingested {args.report}: '{rep.subject}' "

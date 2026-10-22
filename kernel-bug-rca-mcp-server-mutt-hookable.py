@@ -62,6 +62,7 @@ RCA_SCRIPT = os.environ.get(
     "KERNEL_RCA_SCRIPT",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "kernel_bug_rca.py"))
 DEFAULT_REPO = os.environ.get("KERNEL_RCA_REPO", os.path.expanduser("~/src/linux"))
+DEFAULT_BRANCH = os.environ.get("KERNEL_RCA_BRANCH", "")
 DEFAULT_BACKEND = os.environ.get("KERNEL_RCA_BACKEND", "ollama")
 DEFAULT_MODEL = os.environ.get("KERNEL_RCA_MODEL", "qwen3:32b")
 DEFAULT_SKILLS = os.environ.get("KERNEL_RCA_SKILLS", "")
@@ -91,6 +92,11 @@ TOOLS = [
                 "repo": {"type": "string",
                          "description": "Kernel git tree (default: env "
                                         "KERNEL_RCA_REPO)."},
+                "branch": {"type": "string",
+                           "description": "Git ref/branch to analyze, e.g. "
+                                          "'for-next' or 'v6.12' (default: "
+                                          "env KERNEL_RCA_BRANCH or the "
+                                          "checked-out HEAD)."},
                 "backend": {"type": "string",
                             "enum": ["ollama", "vllm"]},
                 "model": {"type": "string"},
@@ -181,6 +187,9 @@ def run_full_rca(args: dict) -> str:
     skills_dir = args.get("skills", DEFAULT_SKILLS)
     if skills_dir:
         cmd += ["--skills", skills_dir]
+    branch = args.get("branch", DEFAULT_BRANCH)
+    if branch:
+        cmd += ["--branch", branch]
     proc = subprocess.run(cmd, capture_output=True, text=True,
                          timeout=TIMEOUT_S)
     if proc.returncode != 0:
