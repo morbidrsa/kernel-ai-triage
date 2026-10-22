@@ -74,12 +74,12 @@ DEFAULT_MODELS = {
 }
 
 SYSTEM_HINTS = (
-    "You are analyzing Linux kernel bug reports, focused on the filesystem and "
-    "storage stack (btrfs, xfs, zoned block devices / zonefs, blk-mq, dm). "
+    "You are analyzing Linux kernel bug reports, focused on the filesystem and
+    " "storage stack (btrfs, xfs, zoned block devices / zonefs, blk-mq, dm). "
     "You know the kernel development process, mailing-list etiquette, and "
-    "common failure patterns of ZNS devices (zone write pointer mismanagement, "
-    "unfinished zone resets, log-tree corruption on zoned btrfs, active zone "
-    "exhaustion, etc.)."
+    "common failure patterns of Zoned Block devices (ZNS,SMR) (zone write
+    pointer mismanagement, " "unfinished zone resets, log-tree corruption on
+    zoned btrfs, active zone " "exhaustion, etc.)."
 )
 
 
