@@ -64,6 +64,7 @@ RCA_SCRIPT = os.environ.get(
 DEFAULT_REPO = os.environ.get("KERNEL_RCA_REPO", os.path.expanduser("~/src/linux"))
 DEFAULT_BACKEND = os.environ.get("KERNEL_RCA_BACKEND", "ollama")
 DEFAULT_MODEL = os.environ.get("KERNEL_RCA_MODEL", "qwen3:32b")
+DEFAULT_SKILLS = os.environ.get("KERNEL_RCA_SKILLS", "")
 MAX_TURNS = os.environ.get("KERNEL_RCA_MAX_TURNS", "10")
 TIMEOUT_S = int(os.environ.get("KERNEL_RCA_TIMEOUT", "1800"))
 
@@ -177,6 +178,9 @@ def run_full_rca(args: dict) -> str:
            "--model", args.get("model", DEFAULT_MODEL),
            "--max-turns", str(args.get("max_turns", MAX_TURNS)),
            "--out", out, "--json-out", json_out, "-q"]
+    skills_dir = args.get("skills", DEFAULT_SKILLS)
+    if skills_dir:
+        cmd += ["--skills", skills_dir]
     proc = subprocess.run(cmd, capture_output=True, text=True,
                          timeout=TIMEOUT_S)
     if proc.returncode != 0:

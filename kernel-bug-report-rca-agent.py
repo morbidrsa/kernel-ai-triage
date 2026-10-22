@@ -7,8 +7,8 @@ Pipeline (multi-agent, sequential with shared state):
   1. INGEST   - parse an mbox file or plain-text bug report (email headers,
                 body, attached dmesg/OOPS traces, test-system metadata).
   2. TRIAGE   - LLM agent classifies the report: subsystem, suspect area,
-                severity, crash type, extracts the crash signature and the
-                set of questions that need answering.
+                severity, crash type, extracts the crash signature, picks
+                applicable skills, and the questions that need answering.
   3. CONTEXT  - tool-driven agent gathers evidence from the local kernel
                 git tree: git log / git show / git blame / grep, plus
                 lore.kernel.org full-text search for prior discussions.
@@ -16,6 +16,11 @@ Pipeline (multi-agent, sequential with shared state):
                 ranked hypothesis, failure chain, suspected commit(s),
                 proposed fix, follow-up questions, and a ready-to-send
                 mailing-list reply draft.
+
+Skills: pass --skills DIR to load reusable instruction packs (Claude-style
+<SKILL NAME>/SKILL.md folders or flat .md prompt snippets). The triage agent
+sees a menu of loaded skills and selects the applicable ones; their full
+bodies are then injected into the RCA agent's prompt.
 
 LLM backend: any OpenAI-compatible endpoint - Ollama (default
 http://localhost:11434/v1) or vLLM (http://localhost:8000/v1).
@@ -26,6 +31,7 @@ Usage:
     python3 kernel_bug_rca.py report.mbox
     python3 kernel_bug_rca.py bug.txt --repo ~/src/linux --model qwen3:32b \
         --backend vllm --max-turns 12 --out rca.md --json-out rca.json
+    python3 kernel_bug_rca.py bug.txt --skills ~/.kernel-skills
 """
 
 from __future__ import annotations
@@ -68,6 +74,7 @@ class Config:
     base_url: str = ""
     model: str = "qwen3:32b"
     repo: str = "."                  # path to local kernel git tree
+    skills_dir: str = ""             # directory of SKILL.md folders or .md files
     max_turns: int = 10              # tool-call loop limit for the context agent
     max_tool_output: int = 8000      # chars of tool output fed back to the LLM
     temperature: float = 0.2
@@ -77,6 +84,98 @@ class Config:
         if not self.base_url:
             self.base_url = VLLM_URL if self.backend == "vllm" else OLLAMA_URL
         self.base_url = self.base_url.rstrip("/")
+
+
+# ---------------------------------------------------------------------------
+# Skills: reusable instruction packs that tune agent behaviour
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Skill:
+    name: str
+    description: str
+    body: str
+
+    def menu_line(self) -> str:
+        return f"- {self.name}: {self.description}"
+
+
+def load_skills(skills_dir: str) -> list[Skill]:
+    """Load skills from a directory.
+
+    Accepted layouts (both are scanned):
+      1. Claude-style:  <dir>/<skill-name>/SKILL.md   (name from frontmatter
+         or folder name; description from frontmatter 'description:')
+      2. Flat snippets: <dir>/<anything>.md           (name = filename stem)
+
+    Frontmatter is parsed leniently (no yaml dependency): a leading '---'
+    block with 'name:'/'description:' lines is stripped from the body.
+    """
+    skills: list[Skill] = []
+    if not skills_dir or not os.path.isdir(skills_dir):
+        return skills
+    candidates: list[tuple[str, str]] = []
+    for entry in sorted(os.listdir(skills_dir)):
+        p = os.path.join(skills_dir, entry)
+        if os.path.isdir(p):
+            sk = os.path.join(p, "SKILL.md")
+            if os.path.isfile(sk):
+                candidates.append((entry, sk))
+        elif entry.lower().endswith(".md"):
+            candidates.append((entry[:-3], p))
+    for default_name, path in candidates:
+        try:
+            raw = open(path, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        name, desc, body = default_name, "", raw.strip()
+        m = re.match(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", raw, re.DOTALL)
+        if m:
+            fm, body = m.group(1), m.group(2)
+            for line in fm.splitlines():
+                kv = re.match(r"^(name|description):\s*(.*)$", line)
+                if kv:
+                    val = kv.group(2).strip().strip('"\'')
+                    if kv.group(1) == "name":
+                        name = val or default_name
+                    else:
+                        desc = val
+        if not desc:
+            first = body.strip().splitlines()
+            desc = first[0][:120] if first else ""
+        skills.append(Skill(name, desc, body.strip()))
+    return skills
+
+
+def skills_menu(skills: list[Skill]) -> str:
+    if not skills:
+        return ""
+    return ("\n\nAVAILABLE SKILLS (specialised review/analysis instruction "
+            "packs; reference them by name in applicable_skills):\n"
+            + "\n".join(s.menu_line() for s in skills))
+
+
+def skill_bodies(skills: list[Skill], names: list[str],
+                 cap: int = 12000) -> str:
+    """Render the full bodies of the named skills, capped at `cap` chars."""
+    if not skills or not names:
+        return ""
+    by_name = {s.name: s for s in skills}
+    out = []
+    for n in names:
+        s = by_name.get(str(n).strip())
+        if not s:
+            # Fuzzy match: skill name contained in the requested string.
+            s = next((x for x in skills if x.name.lower() in str(n).lower()
+                      or str(n).lower() in x.name.lower()), None)
+        if s:
+            out.append(f"### SKILL: {s.name}\n{s.body}\n### END SKILL\n")
+    text = "\n".join(out)
+    if len(text) > cap:
+        text = text[:cap] + "\n(skill text truncated)"
+    return ("\n\nACTIVE SKILLS (follow these instructions where they "
+            "conflict with your defaults):\n" + text) if text else ""
 
 
 # ---------------------------------------------------------------------------
@@ -171,10 +270,10 @@ class BugReport:
         t = (self.trace or self.body).lower()
         for pat, name in [
             (r"kernel panic", "panic"),
-            (r"general protection fault|Oops:|RIP:", "oops/gpf"),
-            (r"WARNING:|list_del corruption|refcount", "warning"),
+            (r"general protection fault|oops:|rip:", "oops/gpf"),
+            (r"warning:|list_del corruption|refcount", "warning"),
             (r"hung_task|blocked for more than", "hung task"),
-            (r"BTRFS error|XFS.*Error|I/O error", "fs/io error"),
+            (r"btrfs error|xfs.*error|i/o error", "fs/io error"),
         ]:
             if re.search(pat, t, re.IGNORECASE):
                 return name
@@ -518,15 +617,19 @@ class ToolAgent:
         return final, evidence
 
 
-def run_triage(llm: LLM, rep: BugReport, log) -> dict:
+def run_triage(llm: LLM, rep: BugReport, log,
+               skills: list[Skill] | None = None) -> dict:
     log("[1/3] TRIAGE agent")
+    if skills:
+        log(f"      {len(skills)} skills loaded: "
+            + ", ".join(s.name for s in skills))
     body = rep.body[:24000]
     prompt = f"""Analyze this Linux kernel bug report and return ONLY a JSON object.
 
 Subject: {rep.subject}
 From: {rep.from_addr}
 Crash type detected by pre-parser: {rep.crash_type}
-
+{skills_menu(skills or [])}
 --- BODY (truncated) ---
 {body}
 --- END BODY ---
@@ -545,6 +648,8 @@ Return JSON with keys:
   "first_bad_version": version string or null if not mentioned,
   "crash_signature": the single most identifying line/function of the trace,
   "stack_frames": [key functions from the call trace],
+  "applicable_skills": [names of skills from the list above that are relevant
+                        to this bug, empty list if none apply],
   "questions": [questions that must be answered to find the root cause],
   "search_hints": [grep patterns / lore queries worth trying, 4-8 items]"""
     out = llm.chat([{"role": "system", "content": SYSTEM_HINTS +
@@ -552,17 +657,20 @@ Return JSON with keys:
                     {"role": "user", "content": prompt}])
     result = _json_block(out["content"]) or {"summary": out["content"]}
     log(f"      -> {result.get('subsystem', '?')} / "
-        f"{result.get('crash_type', '?')} / sev={result.get('severity', '?')}")
+        f"{result.get('crash_type', '?')} / sev={result.get('severity', '?')}"
+        + (f" / skills={result.get('applicable_skills')}"
+           if result.get("applicable_skills") else ""))
     return result
 
 
-def run_context(llm: LLM, cfg: Config, rep: BugReport, triage: dict, log) -> dict:
+def run_context(llm: LLM, cfg: Config, rep: BugReport, triage: dict, log,
+                skills: list[Skill] | None = None) -> dict:
     log("[2/3] CONTEXT agent (tools: git, grep, lore)")
     agent = ToolAgent(llm, cfg, build_tools(cfg), log)
     hints = "\n".join(f"- {h}" for h in triage.get("search_hints", []))
     questions = "\n".join(f"- {q}" for q in triage.get("questions", []))
     frames = ", ".join(str(f) for f in triage.get("stack_frames", []))
-    system = SYSTEM_HINTS + f"""
+    system = SYSTEM_HINTS + skills_menu(skills or []) + f"""
 
 You are the EVIDENCE-GATHERING agent. Investigate the local kernel git tree
 ({cfg.repo}) and lore.kernel.org to collect facts about this bug.
@@ -599,15 +707,19 @@ Check the tree version with the kernel_version tool, then gather evidence."""
     return result
 
 
-def run_rca(llm: LLM, rep: BugReport, triage: dict, context: dict, log) -> dict:
+def run_rca(llm: LLM, rep: BugReport, triage: dict, context: dict, log,
+            skills: list[Skill] | None = None) -> dict:
     log("[3/3] RCA agent")
+    active = skill_bodies(skills or [], triage.get("applicable_skills") or [])
+    if active:
+        log(f"      active skills: {triage.get('applicable_skills')}")
     evidence = json.dumps(context.get("evidence", []), indent=1)[:20000]
     suspects = json.dumps(context.get("suspect_commits", []), indent=1)[:6000]
     keys = ("summary", "subsystem", "severity", "crash_type",
             "crash_signature", "stack_frames")
     triage_brief = json.dumps({k: triage.get(k) for k in keys})
     prompt = f"""You are the ROOT CAUSE ANALYSIS agent for a Linux kernel bug.
-
+{active}
 BUG REPORT
 Subject: {rep.subject}
 Triage: {triage_brief}
@@ -671,6 +783,7 @@ def render_markdown(rep: BugReport, triage: dict, context: dict, rca: dict,
         for e in context.get("evidence", [])) or "- (none)"
     sketch = rca.get("proposed_patch_sketch") or ""
     reply = rca.get("reply_draft") or ""
+    used_skills = md_list(triage.get("applicable_skills"))
 
     return f"""# Kernel Bug RCA: {rep.subject}
 
@@ -692,6 +805,8 @@ def render_markdown(rep: BugReport, triage: dict, context: dict, rca: dict,
 | First bad version | {triage.get('first_bad_version')} |
 
 **Stack frames.** {', '.join(str(f) for f in triage.get('stack_frames', []))}
+
+**Skills applied.** {used_skills}
 
 ## 2. Evidence ({len(context.get('_tool_calls', []))} tool calls)
 
@@ -753,6 +868,8 @@ def main() -> int:
         description="Agentic RCA for Linux kernel bug reports (mbox or txt).")
     ap.add_argument("report", help="bug report file (.mbox or .txt)")
     ap.add_argument("--repo", default=".", help="local kernel git tree path")
+    ap.add_argument("--skills", default=os.environ.get("KERNEL_RCA_SKILLS", ""),
+                    help="directory with skills (SKILL.md folders or .md files)")
     ap.add_argument("--backend", choices=["ollama", "vllm"], default="ollama")
     ap.add_argument("--base-url", default="", help="override endpoint base URL")
     ap.add_argument("--model", default="qwen3:32b")
@@ -768,18 +885,23 @@ def main() -> int:
 
     cfg = Config(backend=args.backend, base_url=args.base_url,
                  model=args.model, repo=args.repo, max_turns=args.max_turns,
-                 json_mode=not args.no_json_mode)
+                 skills_dir=args.skills, json_mode=not args.no_json_mode)
     cfg.resolve()
 
     def log(msg):
         if not args.quiet:
             print(msg, file=sys.stderr)
 
+    skills = load_skills(cfg.skills_dir)
+    if cfg.skills_dir and not skills:
+        log(f"warning: no skills found in {cfg.skills_dir}")
+
     if not os.path.isdir(os.path.join(cfg.repo, ".git")):
         log(f"warning: {cfg.repo} does not look like a git tree")
 
     log(f"kernel-bug-rca | model={cfg.model} backend={cfg.backend} "
-        f"({cfg.base_url}) repo={cfg.repo}")
+        f"({cfg.base_url}) repo={cfg.repo}"
+        + (f" skills={cfg.skills_dir} ({len(skills)})" if skills else ""))
     rep = ingest(args.report)
     log(f"Ingested {args.report}: '{rep.subject}' "
         f"({rep.metadata.get('n_messages', 1)} msg(s), "
@@ -788,9 +910,9 @@ def main() -> int:
     llm = LLM(cfg)
     t0 = time.time()
     try:
-        triage = run_triage(llm, rep, log)
-        context = run_context(llm, cfg, rep, triage, log)
-        rca = run_rca(llm, rep, triage, context, log)
+        triage = run_triage(llm, rep, log, skills)
+        context = run_context(llm, cfg, rep, triage, log, skills)
+        rca = run_rca(llm, rep, triage, context, log, skills)
     except urllib.error.URLError as e:
         log(f"error: cannot reach LLM backend at {cfg.base_url}: {e}")
         return 2
