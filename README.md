@@ -159,3 +159,5 @@ GPL-2.0-or-later. Source files carry:
 
 Automated output is a starting point, not a substitute for review — verify
 culprit commits and proposed fixes before acting on them.
+
+The whole project is vibe coded using [Mistral](https://chat.mistral.ai)
