@@ -97,8 +97,23 @@ TOOLS = [
                                           "'for-next' or 'v6.12' (default: "
                                           "env KERNEL_RCA_BRANCH or the "
                                           "checked-out HEAD)."},
+                "max_tokens": {"type": "integer",
+                               "description": "max output tokens "
+                                              "(claude backend)."},
+                "skills": {"type": "string",
+                           "description": "Directory with skills "
+                                          "(SKILL.md folders or .md files); "
+                                          "default: env KERNEL_RCA_SKILLS."},
                 "backend": {"type": "string",
-                            "enum": ["ollama", "vllm"]},
+                            "enum": ["ollama", "vllm", "mistral", "claude"],
+                            "description": "LLM backend. mistral/claude are "
+                                           "hosted; keys come from the "
+                                           "server env (MISTRAL_API_KEY / "
+                                           "ANTHROPIC_API_KEY) or the "
+                                           "api_key argument."},
+                "api_key": {"type": "string",
+                            "description": "API key for mistral/claude "
+                                           "(prefer env vars)."},
                 "model": {"type": "string"},
                 "max_turns": {"type": "integer"},
                 "out": {"type": "string",
@@ -190,6 +205,12 @@ def run_full_rca(args: dict) -> str:
     branch = args.get("branch", DEFAULT_BRANCH)
     if branch:
         cmd += ["--branch", branch]
+    api_key = args.get("api_key", "")
+    if api_key:
+        cmd += ["--api-key", api_key]
+    max_tokens = args.get("max_tokens")
+    if max_tokens:
+        cmd += ["--max-tokens", str(max_tokens)]
     proc = subprocess.run(cmd, capture_output=True, text=True,
                          timeout=TIMEOUT_S)
     if proc.returncode != 0:

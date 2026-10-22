@@ -22,8 +22,10 @@ Skills: pass --skills DIR to load reusable instruction packs (Claude-style
 sees a menu of loaded skills and selects the applicable ones; their full
 bodies are then injected into the RCA agent's prompt.
 
-LLM backend: any OpenAI-compatible endpoint - Ollama (default
-http://localhost:11434/v1) or vLLM (http://localhost:8000/v1).
+LLM backends: Ollama (default, http://localhost:11434/v1), vLLM
+(http://localhost:8000/v1), Mistral API (api.mistral.ai, OpenAI-compatible),
+or Anthropic Claude (api.anthropic.com, native Messages API). API keys come
+from the environment: MISTRAL_API_KEY or ANTHROPIC_API_KEY (or --api-key).
 
 Only stdlib is used (urllib, json, subprocess, mailbox, argparse) - no pip deps.
 
@@ -32,6 +34,8 @@ Usage:
     python3 kernel_bug_rca.py bug.txt --repo ~/src/linux --model qwen3:32b \
         --backend vllm --max-turns 12 --out rca.md --json-out rca.json
     python3 kernel_bug_rca.py bug.txt --skills ~/.kernel-skills
+    python3 kernel_bug_rca.py bug.txt --backend mistral --model mistral-large-latest
+    python3 kernel_bug_rca.py bug.txt --backend claude --model claude-sonnet-4-5
 """
 
 from __future__ import annotations
@@ -55,8 +59,18 @@ from typing import Any, Callable
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434/v1")
 VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8000/v1")
+MISTRAL_URL = os.environ.get("MISTRAL_URL", "https://api.mistral.ai/v1")
+ANTHROPIC_URL = os.environ.get("ANTHROPIC_URL", "https://api.anthropic.com")
 LORE_SEARCH_URL = "https://lore.kernel.org/all/?q="
 HTTP_TIMEOUT = 240
+
+# Fallback model per backend when --model is not given.
+DEFAULT_MODELS = {
+    "ollama": "qwen3:32b",
+    "vllm": "Qwen3-32B",
+    "mistral": "mistral-large-latest",
+    "claude": "claude-sonnet-4-5",
+}
 
 SYSTEM_HINTS = (
     "You are analyzing Linux kernel bug reports, focused on the filesystem and "
@@ -70,12 +84,14 @@ SYSTEM_HINTS = (
 
 @dataclass
 class Config:
-    backend: str = "ollama"          # "ollama" or "vllm"
+    backend: str = "ollama"          # ollama | vllm | mistral | claude
     base_url: str = ""
-    model: str = "qwen3:32b"
+    model: str = ""                 # resolved per backend if left empty
     repo: str = "."                  # path to local kernel git tree
     branch: str = ""                 # git ref to analyze (default: checked-out HEAD)
     skills_dir: str = ""             # directory of SKILL.md folders or .md files
+    api_key: str = ""                # mistral/claude key (env: *_API_KEY)
+    max_tokens: int = 8192           # required by the Anthropic API
     max_turns: int = 10              # tool-call loop limit for the context agent
     max_tool_output: int = 8000      # chars of tool output fed back to the LLM
     temperature: float = 0.2
@@ -83,8 +99,21 @@ class Config:
 
     def resolve(self) -> None:
         if not self.base_url:
-            self.base_url = VLLM_URL if self.backend == "vllm" else OLLAMA_URL
+            self.base_url = {
+                "vllm": VLLM_URL,
+                "mistral": MISTRAL_URL,
+                "claude": ANTHROPIC_URL,
+            }.get(self.backend, OLLAMA_URL)
         self.base_url = self.base_url.rstrip("/")
+        if not self.model:
+            self.model = DEFAULT_MODELS.get(self.backend, DEFAULT_MODELS["ollama"])
+        if not self.api_key:
+            env_var = {
+                "mistral": "MISTRAL_API_KEY",
+                "claude": "ANTHROPIC_API_KEY",
+                "vllm": "VLLM_API_KEY",
+            }.get(self.backend, "LLM_API_KEY")
+            self.api_key = os.environ.get(env_var, "")
 
 
 # ---------------------------------------------------------------------------
@@ -185,12 +214,27 @@ def skill_bodies(skills: list[Skill], names: list[str],
 
 
 class LLM:
+    """Chat client for the configured backend.
+
+    ollama / vllm / mistral speak the OpenAI chat-completions protocol.
+    claude uses the Anthropic Messages API; the OpenAI-style messages and
+    tool schemas used internally by the agents are converted transparently.
+    """
+
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.calls = 0
 
     def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
-        """One chat-completion call. Returns {"content": str, "tool_calls": [...]}"""
+        """One model call. Returns {"content": str, "tool_calls": [...]}"""
+        if self.cfg.backend == "claude":
+            return self._chat_anthropic(messages, tools)
+        return self._chat_openai(messages, tools)
+
+    # -- OpenAI-compatible: ollama, vLLM, Mistral ----------------------------
+
+    def _chat_openai(self, messages: list[dict],
+                     tools: list[dict] | None) -> dict:
         payload: dict[str, Any] = {
             "model": self.cfg.model,
             "messages": messages,
@@ -200,10 +244,13 @@ class LLM:
             payload["tools"] = tools
         if self.cfg.json_mode and not tools:
             payload["response_format"] = {"type": "json_object"}
+        headers = {"Content-Type": "application/json"}
+        if self.cfg.api_key:
+            headers["Authorization"] = f"Bearer {self.cfg.api_key}"
         req = urllib.request.Request(
             self.cfg.base_url + "/chat/completions",
             data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         self.calls += 1
@@ -221,6 +268,88 @@ class LLM:
                 for tc in (msg.get("tool_calls") or [])
             ],
         }
+
+    # -- Anthropic Messages API (claude) -------------------------------------
+
+    def _chat_anthropic(self, messages: list[dict],
+                        tools: list[dict] | None) -> dict:
+        system_texts: list[str] = []
+        msgs: list[dict] = []
+        for msg in messages:
+            role = msg.get("role")
+            if role == "system":
+                system_texts.append(msg.get("content") or "")
+            elif role == "tool":
+                # OpenAI tool result -> Anthropic user/tool_result block.
+                msgs.append({"role": "user", "content": [
+                    {"type": "tool_result",
+                     "tool_use_id": msg.get("tool_call_id"),
+                     "content": msg.get("content") or ""}]})
+            elif role == "assistant" and msg.get("tool_calls"):
+                blocks = []
+                if msg.get("content"):
+                    blocks.append({"type": "text", "text": msg["content"]})
+                for tc in msg["tool_calls"]:
+                    fn = tc.get("function", {})
+                    blocks.append({
+                        "type": "tool_use",
+                        "id": tc.get("id"),
+                        "name": fn.get("name"),
+                        "input": _safe_json(fn.get("arguments") or "{}"),
+                    })
+                msgs.append({"role": "assistant", "content": blocks})
+            else:
+                msgs.append({"role": role, "content": msg.get("content") or ""})
+
+        # The Messages API requires strictly alternating roles; merge runs of
+        # consecutive same-role messages (e.g. text assistant + tool_use
+        # assistant, or tool_result user + plain user).
+        merged: list[dict] = []
+        for msg in msgs:
+            if merged and merged[-1]["role"] == msg["role"]:
+                prev = merged[-1]["content"]
+                cur = msg["content"]
+                prev = prev if isinstance(prev, list) else \
+                    [{"type": "text", "text": prev}]
+                cur = cur if isinstance(cur, list) else \
+                    [{"type": "text", "text": cur}]
+                merged[-1]["content"] = prev + cur
+            else:
+                merged.append(msg)
+
+        payload: dict[str, Any] = {
+            "model": self.cfg.model,
+            "max_tokens": self.cfg.max_tokens,
+            "temperature": self.cfg.temperature,
+            "messages": merged,
+        }
+        if system_texts:
+            payload["system"] = "\n\n".join(system_texts)
+        if tools:
+            payload["tools"] = [
+                {"name": t["function"]["name"],
+                 "description": t["function"].get("description", ""),
+                 "input_schema": t["function"].get(
+                     "parameters", {"type": "object", "properties": {}})}
+                for t in tools]
+        req = urllib.request.Request(
+            self.cfg.base_url + "/v1/messages",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json",
+                     "x-api-key": self.cfg.api_key,
+                     "anthropic-version": "2023-06-01"},
+            method="POST",
+        )
+        self.calls += 1
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode())
+        blocks = data.get("content", [])
+        content = "".join(b.get("text", "") for b in blocks
+                          if b.get("type") == "text")
+        tool_calls = [{"id": b.get("id"), "name": b.get("name"),
+                       "args": b.get("input", {})}
+                      for b in blocks if b.get("type") == "tool_use"]
+        return {"content": content, "tool_calls": tool_calls}
 
 
 def _safe_json(s: str) -> dict:
@@ -908,9 +1037,19 @@ def main() -> int:
                          "tree, without touching your checkout)")
     ap.add_argument("--skills", default=os.environ.get("KERNEL_RCA_SKILLS", ""),
                     help="directory with skills (SKILL.md folders or .md files)")
-    ap.add_argument("--backend", choices=["ollama", "vllm"], default="ollama")
+    ap.add_argument("--backend",
+                    choices=["ollama", "vllm", "mistral", "claude"],
+                    default="ollama")
     ap.add_argument("--base-url", default="", help="override endpoint base URL")
-    ap.add_argument("--model", default="qwen3:32b")
+    ap.add_argument("--model", default="",
+                    help="model name (default per backend: ollama=qwen3:32b, "
+                         "vllm=Qwen3-32B, mistral=mistral-large-latest, "
+                         "claude=claude-sonnet-4-5)")
+    ap.add_argument("--api-key", default="",
+                    help="API key for mistral/claude (prefer env vars "
+                         "MISTRAL_API_KEY / ANTHROPIC_API_KEY)")
+    ap.add_argument("--max-tokens", type=int, default=8192,
+                    help="max output tokens (required by the claude backend)")
     ap.add_argument("--max-turns", type=int, default=10,
                     help="max tool-call rounds for the context agent")
     ap.add_argument("--out", default="", help="output markdown file")
@@ -924,6 +1063,7 @@ def main() -> int:
     cfg = Config(backend=args.backend, base_url=args.base_url,
                  model=args.model, repo=args.repo, max_turns=args.max_turns,
                  skills_dir=args.skills, branch=args.branch,
+                 api_key=args.api_key, max_tokens=args.max_tokens,
                  json_mode=not args.no_json_mode)
     cfg.resolve()
 
@@ -937,6 +1077,11 @@ def main() -> int:
 
     if not os.path.isdir(os.path.join(cfg.repo, ".git")):
         log(f"warning: {cfg.repo} does not look like a git tree")
+    if cfg.backend in ("mistral", "claude") and not cfg.api_key:
+        log(f"error: {cfg.backend} backend needs an API key; set "
+            f"{'MISTRAL_API_KEY' if cfg.backend == 'mistral' else 'ANTHROPIC_API_KEY'} "
+            f"or use --api-key")
+        return 2
     if cfg.branch:
         probe = subprocess.run(["git", "-C", cfg.repo, "rev-parse",
                                 "--verify", cfg.branch],
