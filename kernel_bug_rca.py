@@ -1,3 +1,4 @@
+# # SPDX-License-Identifier: GPL-2.0-or-later
 #!/usr/bin/env python3
 """
 kernel-bug-rca: Agentic root-cause-analysis for Linux kernel bug reports.
